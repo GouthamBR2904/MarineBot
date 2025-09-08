@@ -72,28 +72,79 @@ def query_llama(prompt):
     output, error = process.communicate(input=prompt)
     if error:
         print("⚠️ LLaMA Error:", error)
-    return output
+
+    lines = [line.strip() for line in output.split("\n") if line.strip()]
+    return lines[-1] if lines else output.strip()
 
 # ===============================
 # MARINE FILTER
 # ===============================
 def is_marine_question(question: str) -> bool:
-    """Allow all ocean-related topics, block unrelated ones."""
     q_lower = question.lower()
 
     ocean_terms = [
         "ocean", "marine", "sea", "coast", "shore", "beach", "reef", "aquatic",
         "plastic", "pollution", "fishing", "whale", "dolphin", "shark",
         "turtle", "seal", "krill", "plankton", "habitat", "ecosystem", "biodiversity",
-        "maritime", "ship", "navigation", "currents", "waves", "tsunami", "coral"
+        "maritime", "ship", "navigation", "currents", "waves", "tsunami", "coral",
+        "kelp", "mangrove", "algae", "seaweed", "seagrass", "ocean floor", "deep sea",
+        "underwater", "marine biology", "marine life", "climate change ocean"
+    ]
+
+    non_marine_context = [
+        "movie", "film", "actor", "actress", "director",
+        "song", "music", "album", "band",
+        "company", "corporation", "startup", "business",
+        "software", "game", "app",
+        "football", "cricket", "basketball", "team", "match", "tournament",
+        "whale company", "big fish movie", "orca energy"
     ]
 
     blocked_terms = [
-        "president", "prime minister", "election", "football", "cricket",
-        "movie", "actor", "politics", "stock market", "AI chatbot"
+        "president", "prime minister", "election", "politics", "government",
+        "stock", "market", "share", "investment", "bitcoin", "crypto",
+        "ai chatbot", "chatgpt", "artificial intelligence"
     ]
 
-    if any(term in q_lower for term in blocked_terms):
+    if any(term in q_lower for term in non_marine_context + blocked_terms):
         return False
 
     return any(term in q_lower for term in ocean_terms)
+
+# ===============================
+# RAG + LLaMA RESPONSE (Grounded in Dataset)
+# ===============================
+def get_rag_llama_response(prompt: str) -> str:
+    try:
+        db = get_vector_db()
+        docs = db.similarity_search(prompt, k=3)
+        context = " ".join([doc.page_content for doc in docs])
+
+        final_prompt = (
+            f"You are a marine biology expert. Use the following marine context to answer:\n\n"
+            f"{context}\n\n"
+            f"Question: {prompt}\n"
+            f"Answer in 1–2 short sentences, max 30 words. "
+            f"Only marine facts, ignore movies, shows, sports, or companies."
+        )
+
+        answer = query_llama(final_prompt)
+        words = answer.split()
+        if len(words) > 50:
+            answer = " ".join(words[:50]) + "..."
+        return answer.strip()
+
+    except Exception:
+        return "Sorry, I couldn't retrieve the answer."
+
+# ===============================
+# QUICK LOOKUP FOR UNITY OBJECTS
+# ===============================
+quick_lookup = {
+    "shark": "Sharks are apex predators with cartilaginous skeletons, vital to marine ecosystems.",
+    "coral": "Corals form reefs that support thousands of marine species.",
+    "turtle": "Sea turtles are migratory reptiles essential to ocean health."
+}
+
+def get_quick_answer(object_name: str):
+    return quick_lookup.get(object_name.lower())

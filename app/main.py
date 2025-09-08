@@ -1,137 +1,128 @@
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
-from rag_pipeline import get_vector_db, query_llama, is_marine_question
+import uvicorn
+import tempfile
 import speech_recognition as sr
 import pyttsx3
-import tempfile
-from sentence_transformers import SentenceTransformer, util
-import re
+import os
+
+from fastapi.staticfiles import StaticFiles
+from rag_pipeline import get_rag_llama_response, is_marine_question, get_quick_answer
 
 app = FastAPI()
 
-# Load Chroma DB
-db = get_vector_db()
+# ===============================
+# STATIC FILE SETUP
+# ===============================
+if not os.path.exists("static/audio"):
+    os.makedirs("static/audio")
 
-# Initialize TTS (pyttsx3)
-tts_engine = pyttsx3.init()
-tts_engine.setProperty('rate', 150)   # Adjust speaking rate
-tts_engine.setProperty('volume', 1.0) # Max volume
-tts_engine.setProperty('voice', tts_engine.getProperty('voices')[0].id)  # Default voice
-
-# Load similarity model
-similarity_model = SentenceTransformer("all-MiniLM-L6-v2")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # ===============================
-# Helper to Clean Output for TTS & Display
-# ===============================
-def clean_for_tts_and_display(text):
-    # Remove markdown formatting symbols
-    text = re.sub(r'[*_`#>]', '', text)
-    # Replace multiple spaces/newlines with single space
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
-
-# ===============================
-# TEXT QUERY ENDPOINT
+# MODELS
 # ===============================
 class QueryRequest(BaseModel):
     question: str
 
-@app.post("/query")
-async def query_bot(request: QueryRequest):
-    question = request.question
+class QueryResponse(BaseModel):
+    status: str
+    question: str
+    answer: str
+    marine_related: bool
+    reason: str = None
 
-    # Marine-only filter
+# ===============================
+# BOT RESPONSE
+# ===============================
+def get_bot_response(question: str) -> str:
+    object_name = question.replace("What is", "").replace("?", "").strip()
+
+    quick_ans = get_quick_answer(object_name)
+    if quick_ans:
+        return quick_ans
+
+    short_prompt = (
+        f"You are a marine biology expert. "
+        f"Answer ONLY about the marine animal, plant, or ecosystem named '{object_name}'. "
+        f"Ignore movies, shows, sports teams, or companies. "
+        f"Give a short factual marine-related answer in 1 sentence."
+    )
+
+    return get_rag_llama_response(short_prompt)
+
+# ===============================
+# TEXT QUERY
+# ===============================
+@app.post("/query", response_model=QueryResponse)
+async def query_bot(request: QueryRequest):
+    question = request.question.strip()
+
+    if not is_marine_question(question):
+        return QueryResponse(
+            status="ignored",
+            question=question,
+            answer="I can only answer marine-related questions.",
+            marine_related=False,
+            reason="The question does not appear to be about the marine ecosystem."
+        )
+
+    answer = get_bot_response(question)
+    return QueryResponse(
+        status="success",
+        question=question,
+        answer=answer,
+        marine_related=True
+    )
+
+# ===============================
+# VOICE QUERY
+# ===============================
+@app.post("/voice_query")
+async def voice_query(file: UploadFile = File(...)):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
+        temp_audio.write(await file.read())
+        temp_audio_path = temp_audio.name
+    
+    recognizer = sr.Recognizer()
+    with sr.AudioFile(temp_audio_path) as source:
+        audio_data = recognizer.record(source)
+    try:
+        question = recognizer.recognize_google(audio_data)
+    except Exception:
+        question = "Could not understand audio."
+
     if not is_marine_question(question):
         return {
             "status": "ignored",
             "question": question,
             "answer": "I can only answer marine-related questions.",
-            "marine_related": False
+            "audio_file": None,
+            "marine_related": False,
+            "reason": "The question does not appear to be about the marine ecosystem."
         }
 
-    # Search Chroma
-    docs = db.similarity_search(question, k=3)
-    context = "\n\n".join([doc.page_content for doc in docs])
+    answer = get_bot_response(question)
 
-    # Similarity + exact phrase check
-    query_embedding = similarity_model.encode(question, convert_to_tensor=True)
-    context_embedding = similarity_model.encode(context, convert_to_tensor=True)
-    similarity_score = util.pytorch_cos_sim(query_embedding, context_embedding).item()
+    tts_filename = f"response_{os.path.basename(temp_audio_path)}.wav"
+    tts_path = os.path.join("static/audio", tts_filename)
 
-    subject_phrase = question.lower()
-    subject_in_context = subject_phrase in context.lower()
+    engine = pyttsx3.init()
+    engine.save_to_file(answer, tts_path)
+    engine.runAndWait()
 
-    # Decide dataset vs LLaMA fallback
-    if similarity_score < 0.5 or not subject_in_context:
-        answer = query_llama(f"You are an expert marine biologist. Answer the following question in detail:\nQuestion: {question}")
-    else:
-        prompt = f"Answer based only on the following marine data:\n\n{context}\n\nQuestion: {question}\nAnswer:"
-        answer = query_llama(prompt)
-
-    clean_answer = clean_for_tts_and_display(answer)
+    audio_url = f"http://127.0.0.1:8000/static/audio/{tts_filename}"
 
     return {
         "status": "success",
         "question": question,
-        "answer": clean_answer,
+        "answer": answer,
+        "audio_file": audio_url,
         "marine_related": True
     }
 
 # ===============================
-# VOICE QUERY ENDPOINT
+# RUN
 # ===============================
-@app.post("/voice_query")
-async def voice_query(file: UploadFile = File(...)):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
-
-    # STT
-    recognizer = sr.Recognizer()
-    with sr.AudioFile(tmp_path) as source:
-        audio_data = recognizer.record(source)
-        try:
-            question = recognizer.recognize_google(audio_data)
-        except sr.UnknownValueError:
-            return {"status": "error", "message": "Could not understand audio."}
-        except sr.RequestError:
-            return {"status": "error", "message": "STT service unavailable."}
-
-    # Marine-only filter
-    if not is_marine_question(question):
-        response_text = "I can only answer marine-related questions."
-    else:
-        # Search Chroma
-        docs = db.similarity_search(question, k=3)
-        context = "\n\n".join([doc.page_content for doc in docs])
-
-        # Similarity + exact phrase check
-        query_embedding = similarity_model.encode(question, convert_to_tensor=True)
-        context_embedding = similarity_model.encode(context, convert_to_tensor=True)
-        similarity_score = util.pytorch_cos_sim(query_embedding, context_embedding).item()
-
-        subject_phrase = question.lower()
-        subject_in_context = subject_phrase in context.lower()
-
-        # Decide dataset vs LLaMA fallback
-        if similarity_score < 0.5 or not subject_in_context:
-            response_text = query_llama(f"You are an expert marine biologist. Answer the following question in detail:\nQuestion: {question}")
-        else:
-            prompt = f"Answer based only on the following marine data:\n\n{context}\n\nQuestion: {question}\nAnswer:"
-            response_text = query_llama(prompt)
-
-    clean_response = clean_for_tts_and_display(response_text)
-
-    # TTS
-    audio_path = "response.wav"
-    tts_engine.save_to_file(clean_response, audio_path)
-    tts_engine.runAndWait()
-
-    return {
-        "status": "success",
-        "question": question,
-        "answer": clean_response,
-        "marine_related": is_marine_question(question),
-        "audio_file": audio_path
-    }
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
